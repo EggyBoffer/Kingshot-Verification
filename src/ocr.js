@@ -1,40 +1,5 @@
-import "dotenv/config";
-
-import {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  ChannelType,
-  PermissionFlagsBits,
-  MessageFlags
-} from "discord.js";
-
-import { CONFIG, rolesFor } from "./roles.js";
-import { extractKingshotProfile } from "./ocr.js";
-import { upsertVerifiedUser } from "./storage.js";
-
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ],
-  partials: [Partials.Channel, Partials.Message, Partials.GuildMember]
-});
-
-const STOP_NAMES = new Set(["as", "an", "id", "kingdom", "alliance", "kills", "mood"]);
-
-function buildNickname(clanTag, playerName) {
-  const tag = String(clanTag || "").toUpperCase().trim();
-  const name = String(playerName || "").trim();
-
-  if (!tag && !name) return null;
-  if (!name) return `[${tag}]`;
-  if (!tag) return name;
-
-  return `[${tag}] ${name}`;
-}
+import sharp from "sharp";
+import { createWorker } from "tesseract.js";
 
 function cleanClanTag(s) {
   return String(s || "")
@@ -49,295 +14,149 @@ function cleanPlayerName(s) {
     .slice(0, 24);
 }
 
-function isPlausibleName(name) {
-  const n = cleanPlayerName(name);
-  if (!n || n.length < 3) return false;
-  if (STOP_NAMES.has(n.toLowerCase())) return false;
-  return true;
-}
+function parseFromText(text) {
+  const raw = String(text || "");
+  const t = raw.replace(/\r/g, "");
 
-function cleanId(s) {
-  const digits = String(s || "").replace(/\D/g, "");
-  return digits.length >= 6 ? digits : null;
-}
+  const idMatch = t.match(/ID\s*[:#]?\s*([0-9]{6,})/i);
+  const kingdomMatch = t.match(/Kingdom\s*[:#]?\s*#?\s*([0-9]{1,4})/i);
+  const allianceMatch = t.match(/Alliance\s*[:#]?\s*([A-Z0-9]{2,6})/i);
 
-function cleanKingdom(s) {
-  const digits = String(s || "").replace(/\D/g, "");
-  return digits.length >= 1 ? digits.slice(0, 4) : null;
-}
+  // Primary: strict "[TAG]Name"
+  const tagAndName = t.match(/\[\s*([A-Z0-9]{2,6})\s*\]\s*([A-Z0-9_]{2,24})/i);
 
-async function applyVerification({
-  guild,
-  userId,
-  clanTag,
-  playerName,
-  gameId,
-  kingdom,
-  giveVerified = true,
-  giveClanRole = true,
-  giveKingdomRole = true,
-  setNickname = true
-}) {
-  const member = await guild.members.fetch(userId);
+  let clanTag = tagAndName ? tagAndName[1] : (allianceMatch ? allianceMatch[1] : null);
+  let playerName = tagAndName ? tagAndName[2] : null;
 
-  const addRoles = [];
-  const removeRoles = [CONFIG.roleUnverifiedId].filter(Boolean);
+  // Fallback: if we can spot "[TAG]" but name didn't parse, grab what follows it
+  if (!playerName) {
+    const tagOnly = t.match(/\[\s*([A-Z0-9]{2,6})\s*\]/);
+    if (tagOnly) {
+      clanTag = clanTag || tagOnly[1];
 
-  if (giveVerified) addRoles.push(CONFIG.roleVerifiedId);
+      const idx = t.indexOf(tagOnly[0]);
+      if (idx !== -1) {
+        const after = t.slice(idx + tagOnly[0].length);
 
-  if (giveClanRole || giveKingdomRole) {
-    const derived = rolesFor(
-      giveClanRole ? clanTag : null,
-      giveKingdomRole ? kingdom : null
-    );
-    addRoles.push(...derived);
-  }
+        const candidate = after
+          .split("\n")[0]
+          .trim()
+          .split(/\s{2,}/)[0]
+          .split("ID:")[0]
+          .split("ID")[0]
+          .trim();
 
-  const toAdd = addRoles.filter(Boolean);
+        const cleaned = cleanPlayerName(candidate);
 
-  if (toAdd.length) await member.roles.add(toAdd);
-  if (removeRoles.length) await member.roles.remove(removeRoles);
-
-  let desiredNick = null;
-  if (setNickname) {
-    const safeName = isPlausibleName(playerName) ? cleanPlayerName(playerName) : null;
-    const safeTag = clanTag ? cleanClanTag(clanTag) : null;
-
-    if (safeName && safeTag) {
-      desiredNick = buildNickname(safeTag, safeName);
-      await member.setNickname(desiredNick, "Kingshot verification nickname sync");
+        // Only accept if it’s not tiny junk
+        if (cleaned.length >= 3) {
+          playerName = cleaned;
+        }
+      }
     }
   }
 
-  upsertVerifiedUser(userId, {
-    gameId: gameId || null,
+  return {
+    id: idMatch ? idMatch[1] : null,
+    kingdom: kingdomMatch ? kingdomMatch[1] : null,
     clanTag: clanTag || null,
-    kingdom: kingdom || null,
-    playerName: isPlausibleName(playerName) ? cleanPlayerName(playerName) : null
+    playerName: playerName || null,
+    raw: t
+  };
+}
+
+function cropByRatios(meta, ratios) {
+  const w = meta.width;
+  const h = meta.height;
+
+  const left = Math.max(0, Math.floor(w * ratios.left));
+  const top = Math.max(0, Math.floor(h * ratios.top));
+  const width = Math.min(w - left, Math.floor(w * ratios.width));
+  const height = Math.min(h - top, Math.floor(h * ratios.height));
+
+  return { left, top, width, height };
+}
+
+async function ocrWithOptions(buffer, options = {}) {
+  const worker = await createWorker("eng");
+  try {
+    const params = {
+      tessedit_pageseg_mode: options.psm ?? "6",
+      tessedit_char_whitelist: options.whitelist ?? "",
+      preserve_interword_spaces: "1"
+    };
+
+    await worker.setParameters(params);
+
+    const { data } = await worker.recognize(buffer);
+    return data.text || "";
+  } finally {
+    await worker.terminate();
+  }
+}
+
+async function preprocessForCard(buffer, crop) {
+  let img = sharp(buffer).extract(crop).grayscale();
+  img = img.resize({ width: Math.max(600, crop.width * 2) });
+  img = img.linear(1.6, -40).sharpen();
+  return await img.png().toBuffer();
+}
+
+async function preprocessForNameHunt(buffer) {
+  let img = sharp(buffer).grayscale();
+
+  const meta = await img.metadata();
+  const targetW = Math.max(900, Math.floor((meta.width || 0) * 1.5));
+  img = img.resize({ width: targetW });
+
+  img = img.linear(2.2, -70).threshold(175).sharpen();
+
+  return await img.png().toBuffer();
+}
+
+export async function extractKingshotProfile(buffer) {
+  const base = sharp(buffer);
+  const meta = await base.metadata();
+  if (!meta.width || !meta.height) throw new Error("Invalid image (missing dimensions).");
+
+  // Bottom card crop (reliable for ID/Kingdom/Alliance)
+  const cardCrop = cropByRatios(meta, {
+    left: 0.02,
+    top: 0.56,
+    width: 0.96,
+    height: 0.40
   });
 
-  return { member, desiredNick };
+  const cardBuf = await preprocessForCard(buffer, cardCrop);
+  const cardText = await ocrWithOptions(cardBuf, { psm: "6" });
+  const cardParsed = parseFromText(cardText);
+
+  // Whole-image “name hunt” pass
+  const huntBuf = await preprocessForNameHunt(buffer);
+  const huntText = await ocrWithOptions(huntBuf, {
+    psm: "6",
+    whitelist: "[]ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_ "
+  });
+  const huntParsed = parseFromText(huntText);
+
+  const clanTag = cleanClanTag(huntParsed.clanTag || cardParsed.clanTag);
+  const playerName = cleanPlayerName(huntParsed.playerName || cardParsed.playerName);
+
+  const merged = {
+    id: cardParsed.id || null,
+    kingdom: cardParsed.kingdom || null,
+    clanTag: clanTag || null,
+    playerName: playerName || null,
+    debug: {
+      cardText,
+      huntText
+    }
+  };
+
+  if (!merged.id || !merged.kingdom || !merged.clanTag) {
+    const missing = ["id", "kingdom", "clanTag"].filter((k) => !merged[k]);
+    throw new Error(`Could not read: ${missing.join(", ")}. (Image may be cropped/wrong screen/low quality.)`);
+  }
+
+  return merged;
 }
-
-client.once("ready", async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-});
-
-client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  if (interaction.commandName === "verify") {
-    try {
-      if (interaction.guildId !== CONFIG.guildId) {
-        return interaction.reply({ content: "❌ Wrong server.", flags: MessageFlags.Ephemeral });
-      }
-
-      if (interaction.channelId !== CONFIG.verifyChannelId) {
-        return interaction.reply({
-          content: "❌ Use /verify in the verification channel.",
-          flags: MessageFlags.Ephemeral
-        });
-      }
-
-      await interaction.reply({
-        content: "✅ Creating your private verification thread…",
-        flags: MessageFlags.Ephemeral
-      });
-
-      const channel = await interaction.channel.fetch();
-      if (!channel || channel.type !== ChannelType.GuildText) {
-        return interaction.followUp({
-          content: "❌ Verification channel must be a normal text channel.",
-          flags: MessageFlags.Ephemeral
-        });
-      }
-
-      const thread = await channel.threads.create({
-        name: `verify-${interaction.user.username}`.slice(0, 100),
-        autoArchiveDuration: 60,
-        type: ChannelType.PrivateThread,
-        invitable: false
-      });
-
-      await thread.members.add(interaction.user.id);
-
-      await thread.send(
-        [
-          `Drop **one screenshot** of your Kingshot **Governor Profile** screen.`,
-          `Best results if you crop to the bottom panel showing **[TAG]Name**, **ID**, **Kingdom**.`,
-          ``,
-          `• Don’t crop out the bottom info panel`,
-          `• One image only`
-        ].join("\n")
-      );
-
-      const collected = await thread.awaitMessages({
-        filter: (m) => m.author.id === interaction.user.id && m.attachments.size > 0,
-        max: 1,
-        time: 3 * 60 * 1000
-      });
-
-      if (!collected.size) {
-        await thread.send("⏳ Timed out. Run /verify again when you’re ready.");
-        await thread.setArchived(true);
-        return;
-      }
-
-      const msg = collected.first();
-      const attachment = msg.attachments.first();
-      if (!attachment) {
-        await thread.send("❌ No attachment found. Try again.");
-        return;
-      }
-
-      await thread.send("🔎 Reading screenshot…");
-
-      const res = await fetch(attachment.url);
-      if (!res.ok) throw new Error(`Failed to download image: ${res.status}`);
-      const arrayBuf = await res.arrayBuffer();
-      const buffer = Buffer.from(arrayBuf);
-
-      const parsed = await extractKingshotProfile(buffer);
-
-      const clanTag = cleanClanTag(parsed.clanTag);
-      const playerName = cleanPlayerName(parsed.playerName || "");
-      const gameId = cleanId(parsed.id);
-      const kingdom = cleanKingdom(parsed.kingdom);
-
-      if (!clanTag || !gameId) {
-        throw new Error("OCR read failed (missing clan tag or ID). Ask an admin to use /verify_manual.");
-      }
-
-      const result = await applyVerification({
-        guild: interaction.guild,
-        userId: interaction.user.id,
-        clanTag,
-        playerName: playerName || null,
-        gameId,
-        kingdom,
-        giveVerified: true,
-        giveClanRole: true,
-        giveKingdomRole: true,
-        setNickname: true
-      });
-
-      await thread.send(
-        [
-          `✅ Verified!`,
-          `• Clan: **${clanTag}**`,
-          `• Name: **${playerName || "Unreadable (ask admin /verify_manual)"}**`,
-          `• ID: **${gameId}**`,
-          `• Kingdom: **${kingdom ? `#${kingdom}` : "Unknown"}**`,
-          result.desiredNick
-            ? `📝 Nickname set to **${result.desiredNick}**`
-            : `📝 Nickname not changed (name unreadable).`
-        ].join("\n")
-      );
-
-      await thread.setArchived(true);
-    } catch (err) {
-      console.error(err);
-      try {
-        const payload = { content: `❌ Verification failed: ${err.message}`, flags: MessageFlags.Ephemeral };
-        if (interaction.deferred || interaction.replied) await interaction.followUp(payload);
-        else await interaction.reply(payload);
-      } catch {}
-    }
-    return;
-  }
-
-  if (interaction.commandName === "verify_manual") {
-    try {
-      if (interaction.guildId !== CONFIG.guildId) {
-        return interaction.reply({ content: "❌ Wrong server.", flags: MessageFlags.Ephemeral });
-      }
-
-      const invoker = await interaction.guild.members.fetch(interaction.user.id);
-      const isAdmin = invoker.permissions.has(PermissionFlagsBits.Administrator);
-      if (!isAdmin) {
-        return interaction.reply({ content: "❌ Admin only.", flags: MessageFlags.Ephemeral });
-      }
-
-      const targetUser = interaction.options.getUser("user", true);
-
-      const giveVerified = interaction.options.getBoolean("give_verified") ?? true;
-      const giveClanRole = interaction.options.getBoolean("give_clan_role") ?? false;
-      const giveKingdomRole = interaction.options.getBoolean("give_kingdom_role") ?? false;
-      const setNickname = interaction.options.getBoolean("set_nickname") ?? true;
-
-      const nameInput = interaction.options.getString("name", false);
-      const clanInput = interaction.options.getString("clan", false);
-      const idInput = interaction.options.getString("id", false);
-      const kingdomInput = interaction.options.getString("kingdom", false);
-
-      const clanTag = clanInput ? cleanClanTag(clanInput) : null;
-      const playerName = nameInput ? cleanPlayerName(nameInput) : null;
-      const gameId = idInput ? cleanId(idInput) : null;
-      const kingdom = kingdomInput ? cleanKingdom(kingdomInput) : null;
-
-      if (giveClanRole && !clanTag) {
-        return interaction.reply({
-          content: "❌ give_clan_role=true requires a clan tag.",
-          flags: MessageFlags.Ephemeral
-        });
-      }
-
-      if (giveKingdomRole && !kingdom) {
-        return interaction.reply({
-          content: "❌ give_kingdom_role=true requires a kingdom number.",
-          flags: MessageFlags.Ephemeral
-        });
-      }
-
-      if (setNickname && (!clanTag || !playerName || !isPlausibleName(playerName))) {
-        return interaction.reply({
-          content: "❌ set_nickname=true requires a valid clan + name.",
-          flags: MessageFlags.Ephemeral
-        });
-      }
-
-      await interaction.reply({
-        content: `🛂 Manual verification in progress for <@${targetUser.id}>…`,
-        flags: MessageFlags.Ephemeral
-      });
-
-      const result = await applyVerification({
-        guild: interaction.guild,
-        userId: targetUser.id,
-        clanTag,
-        playerName,
-        gameId,
-        kingdom,
-        giveVerified,
-        giveClanRole,
-        giveKingdomRole,
-        setNickname
-      });
-
-      const summary = [
-        `✅ Manual verification complete for <@${targetUser.id}>`,
-        giveVerified ? `• Verified role: **Yes**` : `• Verified role: **No**`,
-        giveClanRole ? `• Clan role: **${clanTag}**` : `• Clan role: **No**`,
-        giveKingdomRole ? `• Kingdom role: **#${kingdom}**` : `• Kingdom role: **No**`,
-        gameId ? `• Stored ID: **${gameId}**` : `• Stored ID: **(not provided)**`,
-        result.desiredNick ? `• Nickname: **${result.desiredNick}**` : `• Nickname: **(unchanged)**`
-      ].join("\n");
-
-      try {
-        if (interaction.channel?.isThread?.()) {
-          await interaction.channel.send(summary);
-        }
-      } catch {}
-    } catch (err) {
-      console.error(err);
-      try {
-        const payload = { content: `❌ Manual verification failed: ${err.message}`, flags: MessageFlags.Ephemeral };
-        if (interaction.deferred || interaction.replied) await interaction.followUp(payload);
-        else await interaction.reply(payload);
-      } catch {}
-    }
-    return;
-  }
-});
-
-client.login(process.env.DISCORD_TOKEN);
