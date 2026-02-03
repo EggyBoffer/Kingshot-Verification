@@ -5,7 +5,8 @@ import {
   GatewayIntentBits,
   Partials,
   ChannelType,
-  PermissionFlagsBits
+  PermissionFlagsBits,
+  MessageFlags
 } from "discord.js";
 
 import { CONFIG, rolesFor } from "./roles.js";
@@ -21,6 +22,8 @@ const client = new Client({
   ],
   partials: [Partials.Channel, Partials.Message, Partials.GuildMember]
 });
+
+const STOP_NAMES = new Set(["as", "an", "id", "kingdom", "alliance", "kills", "mood"]);
 
 function buildNickname(clanTag, playerName) {
   const tag = String(clanTag || "").toUpperCase().trim();
@@ -46,6 +49,13 @@ function cleanPlayerName(s) {
     .slice(0, 24);
 }
 
+function isPlausibleName(name) {
+  const n = cleanPlayerName(name);
+  if (!n || n.length < 3) return false;
+  if (STOP_NAMES.has(n.toLowerCase())) return false;
+  return true;
+}
+
 function cleanId(s) {
   const digits = String(s || "").replace(/\D/g, "");
   return digits.length >= 6 ? digits : null;
@@ -66,7 +76,10 @@ async function applyVerification({ guild, userId, clanTag, playerName, gameId, k
   if (toAdd.length) await member.roles.add(toAdd);
   if (toRemove.length) await member.roles.remove(toRemove);
 
-  const desiredNick = buildNickname(clanTag, playerName);
+  // Only set nickname if we have a plausible in-game name
+  const safeName = isPlausibleName(playerName) ? cleanPlayerName(playerName) : null;
+  const desiredNick = safeName ? buildNickname(clanTag, safeName) : null;
+
   if (desiredNick) {
     await member.setNickname(desiredNick, "Kingshot verification nickname sync");
   }
@@ -75,7 +88,7 @@ async function applyVerification({ guild, userId, clanTag, playerName, gameId, k
     gameId,
     clanTag,
     kingdom: kingdom || null,
-    playerName: playerName || null
+    playerName: safeName || null
   });
 
   return { member, desiredNick, roleIds };
@@ -92,26 +105,26 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName === "verify") {
     try {
       if (interaction.guildId !== CONFIG.guildId) {
-        return interaction.reply({ content: "❌ Wrong server.", ephemeral: true });
+        return interaction.reply({ content: "❌ Wrong server.", flags: MessageFlags.Ephemeral });
       }
 
       if (interaction.channelId !== CONFIG.verifyChannelId) {
         return interaction.reply({
           content: "❌ Use /verify in the verification channel.",
-          ephemeral: true
+          flags: MessageFlags.Ephemeral
         });
       }
 
       await interaction.reply({
         content: "✅ Creating your private verification thread…",
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
 
       const channel = await interaction.channel.fetch();
       if (!channel || channel.type !== ChannelType.GuildText) {
         return interaction.followUp({
           content: "❌ Verification channel must be a normal text channel.",
-          ephemeral: true
+          flags: MessageFlags.Ephemeral
         });
       }
 
@@ -173,11 +186,12 @@ client.on("interactionCreate", async (interaction) => {
         throw new Error("OCR read failed (missing clan tag or ID). Ask an admin to use /verify_manual.");
       }
 
-      await applyVerification({
+      const result = await applyVerification({
         guild: interaction.guild,
         userId: interaction.user.id,
         clanTag,
-        playerName: playerName || interaction.user.username,
+        // IMPORTANT: do NOT fall back to Discord username; only rename if OCR name is plausible
+        playerName: playerName || null,
         gameId,
         kingdom
       });
@@ -186,11 +200,14 @@ client.on("interactionCreate", async (interaction) => {
         [
           `✅ Verified!`,
           `• Clan: **${clanTag}**`,
-          `• Name: **${playerName || "Unknown"}**`,
+          `• Name: **${playerName || "Unreadable (ask admin for /verify_manual)"}**`,
           `• ID: **${gameId}**`,
           `• Kingdom: **${kingdom ? `#${kingdom}` : "Unknown"}**`,
           ``,
-          `Roles assigned. Your ID has been stored.`
+          `Roles assigned. Your ID has been stored.`,
+          result.desiredNick
+            ? `📝 Nickname set to **${result.desiredNick}**`
+            : `📝 Nickname not changed (couldn’t read the username cleanly).`
         ].join("\n")
       );
 
@@ -198,10 +215,11 @@ client.on("interactionCreate", async (interaction) => {
     } catch (err) {
       console.error(err);
       try {
+        const payload = { content: `❌ Verification failed: ${err.message}`, flags: MessageFlags.Ephemeral };
         if (interaction.deferred || interaction.replied) {
-          await interaction.followUp({ content: `❌ Verification failed: ${err.message}`, ephemeral: true });
+          await interaction.followUp(payload);
         } else {
-          await interaction.reply({ content: `❌ Verification failed: ${err.message}`, ephemeral: true });
+          await interaction.reply(payload);
         }
       } catch {}
     }
@@ -212,14 +230,13 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName === "verify_manual") {
     try {
       if (interaction.guildId !== CONFIG.guildId) {
-        return interaction.reply({ content: "❌ Wrong server.", ephemeral: true });
+        return interaction.reply({ content: "❌ Wrong server.", flags: MessageFlags.Ephemeral });
       }
 
-      // Admin only
       const invoker = await interaction.guild.members.fetch(interaction.user.id);
       const isAdmin = invoker.permissions.has(PermissionFlagsBits.Administrator);
       if (!isAdmin) {
-        return interaction.reply({ content: "❌ Admin only.", ephemeral: true });
+        return interaction.reply({ content: "❌ Admin only.", flags: MessageFlags.Ephemeral });
       }
 
       const targetUser = interaction.options.getUser("user", true);
@@ -233,16 +250,18 @@ client.on("interactionCreate", async (interaction) => {
       const gameId = cleanId(idInput);
       const kingdom = kingdomInput ? cleanKingdom(kingdomInput) : null;
 
-      if (!clanTag) return interaction.reply({ content: "❌ Invalid clan tag.", ephemeral: true });
-      if (!playerName) return interaction.reply({ content: "❌ Invalid name.", ephemeral: true });
-      if (!gameId) return interaction.reply({ content: "❌ Invalid ID (digits only, 6+ length).", ephemeral: true });
-
-      // Optional: require kingdom if you want kingdom roles always correct
-      // if (!kingdom) return interaction.reply({ content: "❌ Kingdom is required for manual verification.", ephemeral: true });
+      if (!clanTag) return interaction.reply({ content: "❌ Invalid clan tag.", flags: MessageFlags.Ephemeral });
+      if (!isPlausibleName(playerName)) return interaction.reply({ content: "❌ Invalid name.", flags: MessageFlags.Ephemeral });
+      if (!gameId) {
+        return interaction.reply({
+          content: "❌ Invalid ID (digits only, 6+ length).",
+          flags: MessageFlags.Ephemeral
+        });
+      }
 
       await interaction.reply({
         content: `🛂 Manual verification in progress for <@${targetUser.id}>…`,
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
 
       const result = await applyVerification({
@@ -256,7 +275,6 @@ client.on("interactionCreate", async (interaction) => {
 
       const nickLine = result.desiredNick ? `Nickname set to **${result.desiredNick}**` : "Nickname not changed.";
 
-      // If run inside the private thread, post a visible confirmation there too
       try {
         if (interaction.channel && interaction.channel.isThread && interaction.channel.isThread()) {
           await interaction.channel.send(
@@ -271,14 +289,14 @@ client.on("interactionCreate", async (interaction) => {
           );
         }
       } catch {}
-
     } catch (err) {
       console.error(err);
       try {
+        const payload = { content: `❌ Manual verification failed: ${err.message}`, flags: MessageFlags.Ephemeral };
         if (interaction.deferred || interaction.replied) {
-          await interaction.followUp({ content: `❌ Manual verification failed: ${err.message}`, ephemeral: true });
+          await interaction.followUp(payload);
         } else {
-          await interaction.reply({ content: `❌ Manual verification failed: ${err.message}`, ephemeral: true });
+          await interaction.reply(payload);
         }
       } catch {}
     }
