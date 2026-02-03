@@ -85,7 +85,6 @@ async function applyVerification({
 
   if (giveVerified) addRoles.push(CONFIG.roleVerifiedId);
 
-  // Only add derived roles if toggled on
   if (giveClanRole || giveKingdomRole) {
     const derived = rolesFor(
       giveClanRole ? clanTag : null,
@@ -110,7 +109,6 @@ async function applyVerification({
     }
   }
 
-  // Only store what we actually have
   upsertVerifiedUser(userId, {
     gameId: gameId || null,
     clanTag: clanTag || null,
@@ -128,7 +126,6 @@ client.once("ready", async () => {
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  // ---------- /verify (OCR path) ----------
   if (interaction.commandName === "verify") {
     try {
       if (interaction.guildId !== CONFIG.guildId) {
@@ -215,7 +212,7 @@ client.on("interactionCreate", async (interaction) => {
         guild: interaction.guild,
         userId: interaction.user.id,
         clanTag,
-        playerName,
+        playerName: playerName || null,
         gameId,
         kingdom,
         giveVerified: true,
@@ -249,7 +246,6 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  // ---------- /verify_manual (Admin-only flexible) ----------
   if (interaction.commandName === "verify_manual") {
     try {
       if (interaction.guildId !== CONFIG.guildId) {
@@ -279,7 +275,6 @@ client.on("interactionCreate", async (interaction) => {
       const gameId = idInput ? cleanId(idInput) : null;
       const kingdom = kingdomInput ? cleanKingdom(kingdomInput) : null;
 
-      // Validate only what's needed
       if (giveClanRole && !clanTag) {
         return interaction.reply({
           content: "❌ give_clan_role=true requires a clan tag.",
@@ -333,7 +328,6 @@ client.on("interactionCreate", async (interaction) => {
           await interaction.channel.send(summary);
         }
       } catch {}
-
     } catch (err) {
       console.error(err);
       try {

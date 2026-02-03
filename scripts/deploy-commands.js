@@ -17,36 +17,33 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("verify_manual")
-    .setDescription("Admin-only manual verification (name/clan/id/kingdom)")
+    .setDescription("Admin-only manual verification (grant selected roles)")
     .addUserOption((opt) =>
-      opt
-        .setName("user")
-        .setDescription("The user to verify")
-        .setRequired(true)
+      opt.setName("user").setDescription("The user to verify").setRequired(true)
+    )
+    .addBooleanOption((opt) =>
+      opt.setName("give_verified").setDescription("Give Verified role").setRequired(false)
+    )
+    .addBooleanOption((opt) =>
+      opt.setName("give_clan_role").setDescription("Give clan role (requires clan)").setRequired(false)
+    )
+    .addBooleanOption((opt) =>
+      opt.setName("give_kingdom_role").setDescription("Give kingdom role (requires kingdom)").setRequired(false)
+    )
+    .addBooleanOption((opt) =>
+      opt.setName("set_nickname").setDescription("Set nickname (requires clan + name)").setRequired(false)
     )
     .addStringOption((opt) =>
-      opt
-        .setName("name")
-        .setDescription("In-game name from the screenshot (e.g. BeachBoffer)")
-        .setRequired(true)
+      opt.setName("name").setDescription("In-game name (optional)").setRequired(false)
     )
     .addStringOption((opt) =>
-      opt
-        .setName("clan")
-        .setDescription("Clan tag from the screenshot (e.g. SOB)")
-        .setRequired(true)
+      opt.setName("clan").setDescription("Clan tag (optional)").setRequired(false)
     )
     .addStringOption((opt) =>
-      opt
-        .setName("id")
-        .setDescription("Kingshot ID from the screenshot (digits only)")
-        .setRequired(true)
+      opt.setName("id").setDescription("Kingshot ID (optional)").setRequired(false)
     )
     .addStringOption((opt) =>
-      opt
-        .setName("kingdom")
-        .setDescription("Kingdom number (e.g. 247)")
-        .setRequired(false)
+      opt.setName("kingdom").setDescription("Kingdom number (optional)").setRequired(false)
     )
 ].map((c) => c.toJSON());
 
