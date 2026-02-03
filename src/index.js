@@ -66,32 +66,59 @@ function cleanKingdom(s) {
   return digits.length >= 1 ? digits.slice(0, 4) : null;
 }
 
-async function applyVerification({ guild, userId, clanTag, playerName, gameId, kingdom }) {
+async function applyVerification({
+  guild,
+  userId,
+  clanTag,
+  playerName,
+  gameId,
+  kingdom,
+  giveVerified = true,
+  giveClanRole = true,
+  giveKingdomRole = true,
+  setNickname = true
+}) {
   const member = await guild.members.fetch(userId);
 
-  const roleIds = rolesFor(clanTag, kingdom);
-  const toAdd = [CONFIG.roleVerifiedId, ...roleIds].filter(Boolean);
-  const toRemove = [CONFIG.roleUnverifiedId].filter(Boolean);
+  const addRoles = [];
+  const removeRoles = [CONFIG.roleUnverifiedId].filter(Boolean);
 
-  if (toAdd.length) await member.roles.add(toAdd);
-  if (toRemove.length) await member.roles.remove(toRemove);
+  if (giveVerified) addRoles.push(CONFIG.roleVerifiedId);
 
-  // Only set nickname if we have a plausible in-game name
-  const safeName = isPlausibleName(playerName) ? cleanPlayerName(playerName) : null;
-  const desiredNick = safeName ? buildNickname(clanTag, safeName) : null;
-
-  if (desiredNick) {
-    await member.setNickname(desiredNick, "Kingshot verification nickname sync");
+  // Only add derived roles if toggled on
+  if (giveClanRole || giveKingdomRole) {
+    const derived = rolesFor(
+      giveClanRole ? clanTag : null,
+      giveKingdomRole ? kingdom : null
+    );
+    addRoles.push(...derived);
   }
 
+  const toAdd = addRoles.filter(Boolean);
+
+  if (toAdd.length) await member.roles.add(toAdd);
+  if (removeRoles.length) await member.roles.remove(removeRoles);
+
+  let desiredNick = null;
+  if (setNickname) {
+    const safeName = isPlausibleName(playerName) ? cleanPlayerName(playerName) : null;
+    const safeTag = clanTag ? cleanClanTag(clanTag) : null;
+
+    if (safeName && safeTag) {
+      desiredNick = buildNickname(safeTag, safeName);
+      await member.setNickname(desiredNick, "Kingshot verification nickname sync");
+    }
+  }
+
+  // Only store what we actually have
   upsertVerifiedUser(userId, {
-    gameId,
-    clanTag,
+    gameId: gameId || null,
+    clanTag: clanTag || null,
     kingdom: kingdom || null,
-    playerName: safeName || null
+    playerName: isPlausibleName(playerName) ? cleanPlayerName(playerName) : null
   });
 
-  return { member, desiredNick, roleIds };
+  return { member, desiredNick };
 }
 
 client.once("ready", async () => {
@@ -139,12 +166,10 @@ client.on("interactionCreate", async (interaction) => {
 
       await thread.send(
         [
-          `Alright <@${interaction.user.id}>, drop **one screenshot** of your Kingshot **Governor Profile** screen (like the example).`,
-          `I’m looking for: **[ClanTag]Name**, **ID**, and **Kingdom**.`,
+          `Drop **one screenshot** of your Kingshot **Governor Profile** screen.`,
+          `Best results if you crop to the bottom panel showing **[TAG]Name**, **ID**, **Kingdom**.`,
           ``,
-          `Tips so the bot doesn’t have a meltdown:`,
-          `• Don’t crop the bottom info panel`,
-          `• Keep it clear (no motion blur)`,
+          `• Don’t crop out the bottom info panel`,
           `• One image only`
         ].join("\n")
       );
@@ -168,7 +193,7 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
-      await thread.send("🔎 Reading screenshot… (if this takes more than a moment, it’s Tesseract being dramatic)");
+      await thread.send("🔎 Reading screenshot…");
 
       const res = await fetch(attachment.url);
       if (!res.ok) throw new Error(`Failed to download image: ${res.status}`);
@@ -190,24 +215,25 @@ client.on("interactionCreate", async (interaction) => {
         guild: interaction.guild,
         userId: interaction.user.id,
         clanTag,
-        // IMPORTANT: do NOT fall back to Discord username; only rename if OCR name is plausible
-        playerName: playerName || null,
+        playerName,
         gameId,
-        kingdom
+        kingdom,
+        giveVerified: true,
+        giveClanRole: true,
+        giveKingdomRole: true,
+        setNickname: true
       });
 
       await thread.send(
         [
           `✅ Verified!`,
           `• Clan: **${clanTag}**`,
-          `• Name: **${playerName || "Unreadable (ask admin for /verify_manual)"}**`,
+          `• Name: **${playerName || "Unreadable (ask admin /verify_manual)"}**`,
           `• ID: **${gameId}**`,
           `• Kingdom: **${kingdom ? `#${kingdom}` : "Unknown"}**`,
-          ``,
-          `Roles assigned. Your ID has been stored.`,
           result.desiredNick
             ? `📝 Nickname set to **${result.desiredNick}**`
-            : `📝 Nickname not changed (couldn’t read the username cleanly).`
+            : `📝 Nickname not changed (name unreadable).`
         ].join("\n")
       );
 
@@ -216,17 +242,14 @@ client.on("interactionCreate", async (interaction) => {
       console.error(err);
       try {
         const payload = { content: `❌ Verification failed: ${err.message}`, flags: MessageFlags.Ephemeral };
-        if (interaction.deferred || interaction.replied) {
-          await interaction.followUp(payload);
-        } else {
-          await interaction.reply(payload);
-        }
+        if (interaction.deferred || interaction.replied) await interaction.followUp(payload);
+        else await interaction.reply(payload);
       } catch {}
     }
     return;
   }
 
-  // ---------- /verify_manual (Admin-only) ----------
+  // ---------- /verify_manual (Admin-only flexible) ----------
   if (interaction.commandName === "verify_manual") {
     try {
       if (interaction.guildId !== CONFIG.guildId) {
@@ -240,21 +263,40 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       const targetUser = interaction.options.getUser("user", true);
-      const nameInput = interaction.options.getString("name", true);
-      const clanInput = interaction.options.getString("clan", true);
-      const idInput = interaction.options.getString("id", true);
+
+      const giveVerified = interaction.options.getBoolean("give_verified") ?? true;
+      const giveClanRole = interaction.options.getBoolean("give_clan_role") ?? false;
+      const giveKingdomRole = interaction.options.getBoolean("give_kingdom_role") ?? false;
+      const setNickname = interaction.options.getBoolean("set_nickname") ?? true;
+
+      const nameInput = interaction.options.getString("name", false);
+      const clanInput = interaction.options.getString("clan", false);
+      const idInput = interaction.options.getString("id", false);
       const kingdomInput = interaction.options.getString("kingdom", false);
 
-      const clanTag = cleanClanTag(clanInput);
-      const playerName = cleanPlayerName(nameInput);
-      const gameId = cleanId(idInput);
+      const clanTag = clanInput ? cleanClanTag(clanInput) : null;
+      const playerName = nameInput ? cleanPlayerName(nameInput) : null;
+      const gameId = idInput ? cleanId(idInput) : null;
       const kingdom = kingdomInput ? cleanKingdom(kingdomInput) : null;
 
-      if (!clanTag) return interaction.reply({ content: "❌ Invalid clan tag.", flags: MessageFlags.Ephemeral });
-      if (!isPlausibleName(playerName)) return interaction.reply({ content: "❌ Invalid name.", flags: MessageFlags.Ephemeral });
-      if (!gameId) {
+      // Validate only what's needed
+      if (giveClanRole && !clanTag) {
         return interaction.reply({
-          content: "❌ Invalid ID (digits only, 6+ length).",
+          content: "❌ give_clan_role=true requires a clan tag.",
+          flags: MessageFlags.Ephemeral
+        });
+      }
+
+      if (giveKingdomRole && !kingdom) {
+        return interaction.reply({
+          content: "❌ give_kingdom_role=true requires a kingdom number.",
+          flags: MessageFlags.Ephemeral
+        });
+      }
+
+      if (setNickname && (!clanTag || !playerName || !isPlausibleName(playerName))) {
+        return interaction.reply({
+          content: "❌ set_nickname=true requires a valid clan + name.",
           flags: MessageFlags.Ephemeral
         });
       }
@@ -270,34 +312,34 @@ client.on("interactionCreate", async (interaction) => {
         clanTag,
         playerName,
         gameId,
-        kingdom
+        kingdom,
+        giveVerified,
+        giveClanRole,
+        giveKingdomRole,
+        setNickname
       });
 
-      const nickLine = result.desiredNick ? `Nickname set to **${result.desiredNick}**` : "Nickname not changed.";
+      const summary = [
+        `✅ Manual verification complete for <@${targetUser.id}>`,
+        giveVerified ? `• Verified role: **Yes**` : `• Verified role: **No**`,
+        giveClanRole ? `• Clan role: **${clanTag}**` : `• Clan role: **No**`,
+        giveKingdomRole ? `• Kingdom role: **#${kingdom}**` : `• Kingdom role: **No**`,
+        gameId ? `• Stored ID: **${gameId}**` : `• Stored ID: **(not provided)**`,
+        result.desiredNick ? `• Nickname: **${result.desiredNick}**` : `• Nickname: **(unchanged)**`
+      ].join("\n");
 
       try {
-        if (interaction.channel && interaction.channel.isThread && interaction.channel.isThread()) {
-          await interaction.channel.send(
-            [
-              `✅ **Manual verification complete** for <@${targetUser.id}>`,
-              `• Clan: **${clanTag}**`,
-              `• Name: **${playerName}**`,
-              `• ID: **${gameId}**`,
-              `• Kingdom: **${kingdom ? `#${kingdom}` : "Unknown"}**`,
-              `• ${nickLine}`
-            ].join("\n")
-          );
+        if (interaction.channel?.isThread?.()) {
+          await interaction.channel.send(summary);
         }
       } catch {}
+
     } catch (err) {
       console.error(err);
       try {
         const payload = { content: `❌ Manual verification failed: ${err.message}`, flags: MessageFlags.Ephemeral };
-        if (interaction.deferred || interaction.replied) {
-          await interaction.followUp(payload);
-        } else {
-          await interaction.reply(payload);
-        }
+        if (interaction.deferred || interaction.replied) await interaction.followUp(payload);
+        else await interaction.reply(payload);
       } catch {}
     }
     return;
