@@ -1,6 +1,10 @@
 import sharp from "sharp";
 import { createWorker } from "tesseract.js";
 
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
 function cleanClanTag(s) {
   return String(s || "")
     .replace(/[^A-Za-z0-9]/g, "")
@@ -22,13 +26,11 @@ function parseFromText(text) {
   const kingdomMatch = t.match(/Kingdom\s*[:#]?\s*#?\s*([0-9]{1,4})/i);
   const allianceMatch = t.match(/Alliance\s*[:#]?\s*([A-Z0-9]{2,6})/i);
 
-  // Primary: strict "[TAG]Name"
   const tagAndName = t.match(/\[\s*([A-Z0-9]{2,6})\s*\]\s*([A-Z0-9_]{2,24})/i);
 
   let clanTag = tagAndName ? tagAndName[1] : (allianceMatch ? allianceMatch[1] : null);
   let playerName = tagAndName ? tagAndName[2] : null;
 
-  // Fallback: if we can spot "[TAG]" but name didn't parse, grab what follows it
   if (!playerName) {
     const tagOnly = t.match(/\[\s*([A-Z0-9]{2,6})\s*\]/);
     if (tagOnly) {
@@ -48,7 +50,6 @@ function parseFromText(text) {
 
         const cleaned = cleanPlayerName(candidate);
 
-        // Only accept if it’s not tiny junk
         if (cleaned.length >= 3) {
           playerName = cleaned;
         }
@@ -77,16 +78,31 @@ function cropByRatios(meta, ratios) {
   return { left, top, width, height };
 }
 
+// Filter noisy tesseract output while keeping progress if you ever want it
+function quietLogger(m) {
+  const msg = String(m?.message || "");
+
+  if (
+    msg.includes("Image too small to scale") ||
+    msg.includes("Line cannot be recognized") ||
+    msg.includes("OSD") ||
+    msg.includes("Estimating resolution")
+  ) {
+    return;
+  }
+}
+
 async function ocrWithOptions(buffer, options = {}) {
-  const worker = await createWorker("eng");
+  const worker = await createWorker("eng", 1, {
+    logger: quietLogger
+  });
+
   try {
-    const params = {
+    await worker.setParameters({
       tessedit_pageseg_mode: options.psm ?? "6",
       tessedit_char_whitelist: options.whitelist ?? "",
       preserve_interword_spaces: "1"
-    };
-
-    await worker.setParameters(params);
+    });
 
     const { data } = await worker.recognize(buffer);
     return data.text || "";
@@ -95,19 +111,80 @@ async function ocrWithOptions(buffer, options = {}) {
   }
 }
 
+/**
+ * Normalize screenshots across phones:
+ * - some devices create massive images that cause sharp/tesseract to fail or OOM
+ * - we downscale large ones and lightly upscale tiny ones
+ */
+async function normalizeInput(buffer) {
+  const img = sharp(buffer, {
+    limitInputPixels: false,
+    failOnError: false
+  });
+
+  const meta = await img.metadata();
+  if (!meta.width || !meta.height) throw new Error("Invalid image (missing dimensions).");
+
+  const w = meta.width;
+  const h = meta.height;
+  const pixels = w * h;
+
+  // Safety rails:
+  // - cap pixel count and max width so we don't blow up RAM on Railway
+  const MAX_WIDTH = 2200;
+  const MAX_PIXELS = 10_000_000; // ~10MP is plenty for OCR after preprocessing
+  const MIN_WIDTH = 900; // helps tiny crops
+
+  let out = img;
+
+  // Downscale if too big (either dimension or total pixels)
+  if (w > MAX_WIDTH || pixels > MAX_PIXELS) {
+    out = out.resize({
+      width: MAX_WIDTH,
+      fit: "inside",
+      withoutEnlargement: true
+    });
+  } else if (w < MIN_WIDTH) {
+    // Light upscale for small images (don’t go crazy)
+    out = out.resize({
+      width: MIN_WIDTH,
+      fit: "inside",
+      withoutEnlargement: false
+    });
+  }
+
+  // Convert to PNG to standardize weird formats/metadata
+  const normalizedBuffer = await out.png().toBuffer();
+  const normalizedMeta = await sharp(normalizedBuffer, {
+    limitInputPixels: false,
+    failOnError: false
+  }).metadata();
+
+  return { buffer: normalizedBuffer, meta: normalizedMeta };
+}
+
 async function preprocessForCard(buffer, crop) {
-  let img = sharp(buffer).extract(crop).grayscale();
-  img = img.resize({ width: Math.max(600, crop.width * 2) });
+  // Crop first, then upscale to a sane width (don’t balloon huge screenshots)
+  let img = sharp(buffer, { limitInputPixels: false, failOnError: false })
+    .extract(crop)
+    .grayscale();
+
+  const targetW = clamp(Math.floor(crop.width * 2), 700, 1600);
+  img = img.resize({ width: targetW, fit: "inside" });
+
   img = img.linear(1.6, -40).sharpen();
   return await img.png().toBuffer();
 }
 
-async function preprocessForNameHunt(buffer) {
-  let img = sharp(buffer).grayscale();
+async function preprocessForNameHunt(buffer, meta) {
+  let img = sharp(buffer, { limitInputPixels: false, failOnError: false }).grayscale();
 
-  const meta = await img.metadata();
-  const targetW = Math.max(900, Math.floor((meta.width || 0) * 1.5));
-  img = img.resize({ width: targetW });
+  const baseW = meta?.width || 0;
+
+  // previously: width * 1.5 (can explode on modern phones)
+  // now: clamp it
+  const targetW = clamp(Math.floor(baseW * 1.25), 900, 2000);
+  img = img.resize({ width: targetW, fit: "inside", withoutEnlargement: false });
 
   img = img.linear(2.2, -70).threshold(175).sharpen();
 
@@ -115,11 +192,13 @@ async function preprocessForNameHunt(buffer) {
 }
 
 export async function extractKingshotProfile(buffer) {
-  const base = sharp(buffer);
-  const meta = await base.metadata();
+  // Normalize input first so all phone screenshots behave similarly
+  const normalized = await normalizeInput(buffer);
+  const normBuf = normalized.buffer;
+  const meta = normalized.meta;
+
   if (!meta.width || !meta.height) throw new Error("Invalid image (missing dimensions).");
 
-  // Bottom card crop (reliable for ID/Kingdom/Alliance)
   const cardCrop = cropByRatios(meta, {
     left: 0.02,
     top: 0.56,
@@ -127,12 +206,11 @@ export async function extractKingshotProfile(buffer) {
     height: 0.40
   });
 
-  const cardBuf = await preprocessForCard(buffer, cardCrop);
+  const cardBuf = await preprocessForCard(normBuf, cardCrop);
   const cardText = await ocrWithOptions(cardBuf, { psm: "6" });
   const cardParsed = parseFromText(cardText);
 
-  // Whole-image “name hunt” pass
-  const huntBuf = await preprocessForNameHunt(buffer);
+  const huntBuf = await preprocessForNameHunt(normBuf, meta);
   const huntText = await ocrWithOptions(huntBuf, {
     psm: "6",
     whitelist: "[]ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_ "
@@ -147,10 +225,7 @@ export async function extractKingshotProfile(buffer) {
     kingdom: cardParsed.kingdom || null,
     clanTag: clanTag || null,
     playerName: playerName || null,
-    debug: {
-      cardText,
-      huntText
-    }
+    debug: { cardText, huntText }
   };
 
   if (!merged.id || !merged.kingdom || !merged.clanTag) {

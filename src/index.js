@@ -140,7 +140,7 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       await interaction.reply({
-        content: "✅ Creating your private verification thread…",
+        content: "✅ Creating your private verification thread… If you dont have a thread please ping @admin",
         flags: MessageFlags.Ephemeral
       });
 
