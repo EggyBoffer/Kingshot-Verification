@@ -23,14 +23,27 @@ function parseFromText(text) {
   const t = raw.replace(/\r/g, "");
 
   const idMatch = t.match(/ID\s*[:#]?\s*([0-9]{6,})/i);
-  const kingdomMatch = t.match(/Kingdom\s*[:#]?\s*#?\s*([0-9]{1,4})/i);
-  const allianceMatch = t.match(/Alliance\s*[:#]?\s*([A-Z0-9]{2,6})/i);
+
+  // Handle multiple languages for Kingdom
+  // English: "Kingdom: #247"
+  // Polish:  "Królestwo: #247"
+  const kingdomMatch =
+    t.match(/Kingdom\s*[:#]?\s*#?\s*([0-9]{1,4})/i) ||
+    t.match(/Kr[oó]lestwo\s*[:#]?\s*#?\s*([0-9]{1,4})/i);
+
+  // Handle multiple languages for Alliance
+  // English: "Alliance: SOB"
+  // Polish:  "Sojusz: SOB"
+  const allianceMatch =
+    t.match(/Alliance\s*[:#]?\s*([A-Z0-9]{2,6})/i) ||
+    t.match(/Sojusz\s*[:#]?\s*([A-Z0-9]{2,6})/i);
 
   const tagAndName = t.match(/\[\s*([A-Z0-9]{2,6})\s*\]\s*([A-Z0-9_]{2,24})/i);
 
-  let clanTag = tagAndName ? tagAndName[1] : (allianceMatch ? allianceMatch[1] : null);
+  let clanTag = tagAndName ? tagAndName[1] : allianceMatch ? allianceMatch[1] : null;
   let playerName = tagAndName ? tagAndName[2] : null;
 
+  // Fallback: find [TAG] and try to read name directly after it on same line
   if (!playerName) {
     const tagOnly = t.match(/\[\s*([A-Z0-9]{2,6})\s*\]/);
     if (tagOnly) {
@@ -78,7 +91,7 @@ function cropByRatios(meta, ratios) {
   return { left, top, width, height };
 }
 
-// Filter noisy tesseract output while keeping progress if you ever want it
+// Quiet noisy tesseract messages that don't impact results
 function quietLogger(m) {
   const msg = String(m?.message || "");
 
@@ -93,9 +106,7 @@ function quietLogger(m) {
 }
 
 async function ocrWithOptions(buffer, options = {}) {
-  const worker = await createWorker("eng", 1, {
-    logger: quietLogger
-  });
+  const worker = await createWorker("eng", 1, { logger: quietLogger });
 
   try {
     await worker.setParameters({
@@ -129,15 +140,12 @@ async function normalizeInput(buffer) {
   const h = meta.height;
   const pixels = w * h;
 
-  // Safety rails:
-  // - cap pixel count and max width so we don't blow up RAM on Railway
   const MAX_WIDTH = 2200;
-  const MAX_PIXELS = 10_000_000; // ~10MP is plenty for OCR after preprocessing
-  const MIN_WIDTH = 900; // helps tiny crops
+  const MAX_PIXELS = 10_000_000; // ~10MP
+  const MIN_WIDTH = 900;
 
   let out = img;
 
-  // Downscale if too big (either dimension or total pixels)
   if (w > MAX_WIDTH || pixels > MAX_PIXELS) {
     out = out.resize({
       width: MAX_WIDTH,
@@ -145,7 +153,6 @@ async function normalizeInput(buffer) {
       withoutEnlargement: true
     });
   } else if (w < MIN_WIDTH) {
-    // Light upscale for small images (don’t go crazy)
     out = out.resize({
       width: MIN_WIDTH,
       fit: "inside",
@@ -153,7 +160,7 @@ async function normalizeInput(buffer) {
     });
   }
 
-  // Convert to PNG to standardize weird formats/metadata
+  // Convert to PNG to standardize odd formats/metadata (HEIF-ish behaviour etc.)
   const normalizedBuffer = await out.png().toBuffer();
   const normalizedMeta = await sharp(normalizedBuffer, {
     limitInputPixels: false,
@@ -181,8 +188,6 @@ async function preprocessForNameHunt(buffer, meta) {
 
   const baseW = meta?.width || 0;
 
-  // previously: width * 1.5 (can explode on modern phones)
-  // now: clamp it
   const targetW = clamp(Math.floor(baseW * 1.25), 900, 2000);
   img = img.resize({ width: targetW, fit: "inside", withoutEnlargement: false });
 
@@ -199,17 +204,47 @@ export async function extractKingshotProfile(buffer) {
 
   if (!meta.width || !meta.height) throw new Error("Invalid image (missing dimensions).");
 
-  const cardCrop = cropByRatios(meta, {
-    left: 0.02,
-    top: 0.56,
-    width: 0.96,
-    height: 0.40
-  });
+  // Multi-crop card region to handle different UI layouts/languages (compact panels)
+  const cardCrops = [
+    // Default (roomier UI)
+    { left: 0.02, top: 0.56, width: 0.96, height: 0.40 },
+    // Compact UI (often non-English / smaller bottom panel)
+    { left: 0.02, top: 0.48, width: 0.96, height: 0.44 }
+  ];
 
-  const cardBuf = await preprocessForCard(normBuf, cardCrop);
-  const cardText = await ocrWithOptions(cardBuf, { psm: "6" });
-  const cardParsed = parseFromText(cardText);
+  let cardParsed = { id: null, kingdom: null, clanTag: null, playerName: null, raw: "" };
+  let cardTextBest = "";
 
+  for (const ratios of cardCrops) {
+    const crop = cropByRatios(meta, ratios);
+    const buf = await preprocessForCard(normBuf, crop);
+    const text = await ocrWithOptions(buf, { psm: "6" });
+    const parsed = parseFromText(text);
+
+    // Keep debug of best attempt
+    if (!cardTextBest) cardTextBest = text;
+
+    // If we have both critical fields, accept immediately
+    if (parsed.id && parsed.kingdom) {
+      cardParsed = parsed;
+      cardTextBest = text;
+      break;
+    }
+
+    // Otherwise merge partial results
+    if (!cardParsed.id) cardParsed.id = parsed.id;
+    if (!cardParsed.kingdom) cardParsed.kingdom = parsed.kingdom;
+    if (!cardParsed.clanTag) cardParsed.clanTag = parsed.clanTag;
+    if (!cardParsed.playerName) cardParsed.playerName = parsed.playerName;
+    if (!cardParsed.raw) cardParsed.raw = parsed.raw;
+
+    // Prefer most recent text as debug if it got something useful
+    if ((parsed.id || parsed.kingdom || parsed.clanTag) && text) {
+      cardTextBest = text;
+    }
+  }
+
+  // Name hunt pass (full-ish image pass) for pulling [TAG]Name reliably
   const huntBuf = await preprocessForNameHunt(normBuf, meta);
   const huntText = await ocrWithOptions(huntBuf, {
     psm: "6",
@@ -225,12 +260,17 @@ export async function extractKingshotProfile(buffer) {
     kingdom: cardParsed.kingdom || null,
     clanTag: clanTag || null,
     playerName: playerName || null,
-    debug: { cardText, huntText }
+    debug: {
+      cardText: cardTextBest || cardParsed.raw || "",
+      huntText
+    }
   };
 
   if (!merged.id || !merged.kingdom || !merged.clanTag) {
     const missing = ["id", "kingdom", "clanTag"].filter((k) => !merged[k]);
-    throw new Error(`Could not read: ${missing.join(", ")}. (Image may be cropped/wrong screen/low quality.)`);
+    throw new Error(
+      `Could not read: ${missing.join(", ")}. (Image may be cropped/wrong screen/low quality.)`
+    );
   }
 
   return merged;
