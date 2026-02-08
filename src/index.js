@@ -5,13 +5,18 @@ import {
   GatewayIntentBits,
   Partials,
   ChannelType,
-  PermissionFlagsBits,
-  MessageFlags
+  EmbedBuilder,
+  MessageFlags,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle
 } from "discord.js";
 
 import { CONFIG, rolesFor } from "./roles.js";
 import { extractKingshotProfile } from "./ocr.js";
 import { upsertVerifiedUser } from "./storage.js";
+
+const VERIFY_LOG_CHANNEL_ID = "1468339673289199767";
 
 const client = new Client({
   intents: [
@@ -22,19 +27,6 @@ const client = new Client({
   ],
   partials: [Partials.Channel, Partials.Message, Partials.GuildMember]
 });
-
-const STOP_NAMES = new Set(["as", "an", "id", "kingdom", "alliance", "kills", "mood"]);
-
-function buildNickname(clanTag, playerName) {
-  const tag = String(clanTag || "").toUpperCase().trim();
-  const name = String(playerName || "").trim();
-
-  if (!tag && !name) return null;
-  if (!name) return `[${tag}]`;
-  if (!tag) return name;
-
-  return `[${tag}] ${name}`;
-}
 
 function cleanClanTag(s) {
   return String(s || "")
@@ -49,110 +41,224 @@ function cleanPlayerName(s) {
     .slice(0, 24);
 }
 
-function isPlausibleName(name) {
-  const n = cleanPlayerName(name);
-  if (!n || n.length < 3) return false;
-  if (STOP_NAMES.has(n.toLowerCase())) return false;
-  return true;
-}
-
 function cleanId(s) {
-  const digits = String(s || "").replace(/\D/g, "");
-  return digits.length >= 6 ? digits : null;
+  const d = String(s || "").replace(/\D/g, "");
+  return d.length >= 6 ? d : null;
 }
 
 function cleanKingdom(s) {
-  const digits = String(s || "").replace(/\D/g, "");
-  return digits.length >= 1 ? digits.slice(0, 4) : null;
+  const d = String(s || "").replace(/\D/g, "");
+  return d ? d.slice(0, 4) : null;
 }
 
-async function applyVerification({
-  guild,
-  userId,
-  clanTag,
-  playerName,
-  gameId,
-  kingdom,
-  giveVerified = true,
-  giveClanRole = true,
-  giveKingdomRole = true,
-  setNickname = true
-}) {
-  const member = await guild.members.fetch(userId);
+function buildNickname(tag, name) {
+  if (!tag && !name) return null;
+  if (!name) return `[${tag}]`;
+  if (!tag) return name;
+  return `[${tag}] ${name}`;
+}
 
-  const addRoles = [];
-  const removeRoles = [CONFIG.roleUnverifiedId].filter(Boolean);
+function channelJump(guildId, channelId) {
+  return `https://discord.com/channels/${guildId}/${channelId}`;
+}
 
-  if (giveVerified) addRoles.push(CONFIG.roleVerifiedId);
+async function sendVerifyLog(guild, embed) {
+  try {
+    const ch = await guild.channels.fetch(VERIFY_LOG_CHANNEL_ID);
+    if (!ch || !ch.isTextBased()) return;
+    await ch.send({ embeds: [embed] });
+  } catch (err) {
+    console.warn("⚠️ Failed to send verification log:", err?.message || err);
+  }
+}
 
-  if (giveClanRole || giveKingdomRole) {
-    const derived = rolesFor(
-      giveClanRole ? clanTag : null,
-      giveKingdomRole ? kingdom : null
-    );
-    addRoles.push(...derived);
+function retryRow(userId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`verify_retry:${userId}`)
+      .setLabel("Retry OCR")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`verify_cancel:${userId}`)
+      .setLabel("Cancel")
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function findLatestAttachmentUrlInThread(thread, userId) {
+  // Pull recent messages and find latest attachment from the user
+  const msgs = await thread.messages.fetch({ limit: 50 }).catch(() => null);
+  if (!msgs) return null;
+
+  for (const m of msgs.values()) {
+    if (m.author?.id !== userId) continue;
+    const att = m.attachments?.first?.();
+    if (att?.url) return att.url;
+  }
+  return null;
+}
+
+async function applyVerificationFromParsed(guild, discordUserId, parsed, thread) {
+  const clanTag = cleanClanTag(parsed.clanTag);
+  const name = cleanPlayerName(parsed.playerName);
+  const id = cleanId(parsed.id);
+  const kingdom = cleanKingdom(parsed.kingdom);
+
+  if (!clanTag || !id || !kingdom) {
+    const missing = [];
+    if (!clanTag) missing.push("clan");
+    if (!id) missing.push("id");
+    if (!kingdom) missing.push("kingdom");
+    throw new Error(`OCR read failed (missing ${missing.join(", ")}).`);
   }
 
-  const toAdd = addRoles.filter(Boolean);
+  const member = await guild.members.fetch(discordUserId);
 
-  if (toAdd.length) await member.roles.add(toAdd);
-  if (removeRoles.length) await member.roles.remove(removeRoles);
+  const roles = [CONFIG.roleVerifiedId, ...rolesFor(clanTag, kingdom)].filter(Boolean);
 
-  let desiredNick = null;
-  if (setNickname) {
-    const safeName = isPlausibleName(playerName) ? cleanPlayerName(playerName) : null;
-    const safeTag = clanTag ? cleanClanTag(clanTag) : null;
+  if (roles.length) await member.roles.add(roles);
+  if (CONFIG.roleUnverifiedId) await member.roles.remove(CONFIG.roleUnverifiedId);
 
-    if (safeName && safeTag) {
-      desiredNick = buildNickname(safeTag, safeName);
-      await member.setNickname(desiredNick, "Kingshot verification nickname sync");
-    }
-  }
+  const nick = buildNickname(clanTag, name);
+  if (nick) await member.setNickname(nick);
 
-  upsertVerifiedUser(userId, {
-    gameId: gameId || null,
-    clanTag: clanTag || null,
-    kingdom: kingdom || null,
-    playerName: isPlausibleName(playerName) ? cleanPlayerName(playerName) : null
+  upsertVerifiedUser(discordUserId, {
+    gameId: id,
+    clanTag,
+    kingdom,
+    playerName: name
   });
 
-  return { member, desiredNick };
+  await thread.send(
+    [
+      "✅ **Verification successful!**",
+      `• Name: **${name || "Unreadable"}**`,
+      `• Clan: **${clanTag}**`,
+      `• ID: **${id}**`,
+      `• Kingdom: **#${kingdom}**`
+    ].join("\n")
+  );
+
+  await sendVerifyLog(
+    guild,
+    new EmbedBuilder()
+      .setTitle("✅ Verification success")
+      .setDescription(`User: <@${discordUserId}>`)
+      .addFields(
+        { name: "Name", value: name || "Unreadable", inline: true },
+        { name: "Clan", value: clanTag, inline: true },
+        { name: "Kingdom", value: `#${kingdom}`, inline: true },
+        { name: "Game ID", value: id, inline: true },
+        { name: "Thread", value: channelJump(guild.id, thread.id) }
+      )
+      .setTimestamp()
+  );
+
+  await thread.setArchived(true);
 }
 
-client.once("ready", async () => {
+async function runOcrAttempt(guild, thread, userId, imageUrl, isRetry) {
+  await thread.send(isRetry ? "🔁 Retrying OCR…" : "🔎 Reading screenshot…");
+
+  const res = await fetch(imageUrl);
+  if (!res.ok) throw new Error("Failed to download image.");
+  const buf = Buffer.from(await res.arrayBuffer());
+
+  const parsed = await extractKingshotProfile(buf);
+  await applyVerificationFromParsed(guild, userId, parsed, thread);
+}
+
+client.once("ready", () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
 client.on("interactionCreate", async (interaction) => {
+  // ======================
+  // Buttons (Retry/Cancel)
+  // ======================
+  if (interaction.isButton()) {
+    const [action, targetUserId] = String(interaction.customId || "").split(":");
+
+    // Lock buttons to the user who is being verified
+    if (!targetUserId || interaction.user.id !== targetUserId) {
+      return interaction.reply({
+        content: "❌ This button isn’t for you.",
+        flags: MessageFlags.Ephemeral
+      });
+    }
+
+    const thread = interaction.channel;
+    if (!thread || thread.type !== ChannelType.PrivateThread) {
+      return interaction.reply({
+        content: "❌ This can only be used inside your verification thread.",
+        flags: MessageFlags.Ephemeral
+      });
+    }
+
+    if (action === "verify_cancel") {
+      await interaction.deferUpdate().catch(() => null);
+      await thread.send("🛑 Cancelled. Run **/verify** again when you’re ready.");
+      await thread.setArchived(true).catch(() => null);
+      return;
+    }
+
+    if (action === "verify_retry") {
+      await interaction.deferUpdate().catch(() => null);
+
+      const url = await findLatestAttachmentUrlInThread(thread, interaction.user.id);
+      if (!url) {
+        await thread.send(
+          "❌ I can’t find a screenshot in this thread. Upload **one** Governor Profile screenshot and press **Retry OCR** again."
+        );
+        return;
+      }
+
+      try {
+        await runOcrAttempt(interaction.guild, thread, interaction.user.id, url, true);
+      } catch (err) {
+        await thread.send(
+          `❌ Retry failed: **${err.message || "Unknown error"}**\nUpload a clearer screenshot (or just the bottom info panel) and press **Retry OCR** again.`
+        );
+
+        await sendVerifyLog(
+          interaction.guild,
+          new EmbedBuilder()
+            .setTitle("❌ Verification retry failed")
+            .setDescription(`User: <@${interaction.user.id}>`)
+            .addFields(
+              { name: "Error", value: err.message || "Unknown error" },
+              { name: "Thread", value: channelJump(interaction.guildId, thread.id) }
+            )
+            .setTimestamp()
+        );
+      }
+
+      return;
+    }
+
+    return;
+  }
+
+  // ======================
+  // Slash commands
+  // ======================
   if (!interaction.isChatInputCommand()) return;
 
   if (interaction.commandName === "verify") {
+    let thread = null;
+
     try {
-      if (interaction.guildId !== CONFIG.guildId) {
-        return interaction.reply({ content: "❌ Wrong server.", flags: MessageFlags.Ephemeral });
-      }
-
-      if (interaction.channelId !== CONFIG.verifyChannelId) {
-        return interaction.reply({
-          content: "❌ Use /verify in the verification channel.",
-          flags: MessageFlags.Ephemeral
-        });
-      }
-
       await interaction.reply({
-        content: "✅ Creating your private verification thread… If you dont have a thread please ping @admin",
+        content: "✅ Creating your private verification thread…",
         flags: MessageFlags.Ephemeral
       });
 
       const channel = await interaction.channel.fetch();
       if (!channel || channel.type !== ChannelType.GuildText) {
-        return interaction.followUp({
-          content: "❌ Verification channel must be a normal text channel.",
-          flags: MessageFlags.Ephemeral
-        });
+        throw new Error("Verification must be run in a text channel.");
       }
 
-      const thread = await channel.threads.create({
+      thread = await channel.threads.create({
         name: `verify-${interaction.user.username}`.slice(0, 100),
         autoArchiveDuration: 60,
         type: ChannelType.PrivateThread,
@@ -161,13 +267,23 @@ client.on("interactionCreate", async (interaction) => {
 
       await thread.members.add(interaction.user.id);
 
+      await sendVerifyLog(
+        interaction.guild,
+        new EmbedBuilder()
+          .setTitle("🟡 Verification started")
+          .setDescription(`User: <@${interaction.user.id}>`)
+          .addFields({ name: "Thread", value: channelJump(interaction.guildId, thread.id) })
+          .setTimestamp()
+      );
+
       await thread.send(
         [
-          `Drop **one screenshot** of your Kingshot **Governor Profile** screen.`,
-          `Best results if you crop to the bottom panel showing **[TAG]Name**, **ID**, **Kingdom**.`,
-          ``,
-          `• Don’t crop out the bottom info panel`,
-          `• One image only`
+          "📸 Upload **one screenshot** of your Kingshot **Governor Profile**.",
+          "You may upload:",
+          "• Full profile screen",
+          "• OR just the bottom info panel",
+          "",
+          "⚠️ One image only."
         ].join("\n")
       );
 
@@ -178,164 +294,55 @@ client.on("interactionCreate", async (interaction) => {
       });
 
       if (!collected.size) {
-        await thread.send("⏳ Timed out. Run /verify again when you’re ready.");
-        await thread.setArchived(true);
-        return;
+        await thread.send({
+          content: "⏳ Timed out. You can upload a screenshot and press **Retry OCR**, or run **/verify** again.",
+          components: [retryRow(interaction.user.id)]
+        });
+        throw new Error("Timed out waiting for screenshot.");
       }
 
-      const msg = collected.first();
-      const attachment = msg.attachments.first();
+      const attachment = collected.first().attachments.first();
       if (!attachment) {
-        await thread.send("❌ No attachment found. Try again.");
-        return;
+        await thread.send({
+          content: "❌ No attachment found. Upload a screenshot and press **Retry OCR**.",
+          components: [retryRow(interaction.user.id)]
+        });
+        throw new Error("No attachment found.");
       }
 
-      await thread.send("🔎 Reading screenshot…");
-
-      const res = await fetch(attachment.url);
-      if (!res.ok) throw new Error(`Failed to download image: ${res.status}`);
-      const arrayBuf = await res.arrayBuffer();
-      const buffer = Buffer.from(arrayBuf);
-
-      const parsed = await extractKingshotProfile(buffer);
-
-      const clanTag = cleanClanTag(parsed.clanTag);
-      const playerName = cleanPlayerName(parsed.playerName || "");
-      const gameId = cleanId(parsed.id);
-      const kingdom = cleanKingdom(parsed.kingdom);
-
-      if (!clanTag || !gameId) {
-        throw new Error("OCR read failed (missing clan tag or ID). Ask an admin to use /verify_manual.");
-      }
-
-      const result = await applyVerification({
-        guild: interaction.guild,
-        userId: interaction.user.id,
-        clanTag,
-        playerName: playerName || null,
-        gameId,
-        kingdom,
-        giveVerified: true,
-        giveClanRole: true,
-        giveKingdomRole: true,
-        setNickname: true
-      });
-
-      await thread.send(
-        [
-          `✅ Verified!`,
-          `• Clan: **${clanTag}**`,
-          `• Name: **${playerName || "Unreadable (ask admin /verify_manual)"}**`,
-          `• ID: **${gameId}**`,
-          `• Kingdom: **${kingdom ? `#${kingdom}` : "Unknown"}**`,
-          result.desiredNick
-            ? `📝 Nickname set to **${result.desiredNick}**`
-            : `📝 Nickname not changed (name unreadable).`
-        ].join("\n")
-      );
-
-      await thread.setArchived(true);
+      await runOcrAttempt(interaction.guild, thread, interaction.user.id, attachment.url, false);
     } catch (err) {
       console.error(err);
-      try {
-        const payload = { content: `❌ Verification failed: ${err.message}`, flags: MessageFlags.Ephemeral };
-        if (interaction.deferred || interaction.replied) await interaction.followUp(payload);
-        else await interaction.reply(payload);
-      } catch {}
+
+      if (thread) {
+        await thread.send({
+          content: `❌ Verification failed: **${err.message || "Unknown error"}**\nUpload a clearer screenshot (or just the bottom info panel) then press **Retry OCR**.`,
+          components: [retryRow(interaction.user.id)]
+        });
+
+        await sendVerifyLog(
+          interaction.guild,
+          new EmbedBuilder()
+            .setTitle("❌ Verification failed")
+            .setDescription(`User: <@${interaction.user.id}>`)
+            .addFields(
+              { name: "Error", value: err.message || "Unknown error" },
+              { name: "Thread", value: channelJump(interaction.guildId, thread.id) }
+            )
+            .setTimestamp()
+        );
+      } else {
+        await sendVerifyLog(
+          interaction.guild,
+          new EmbedBuilder()
+            .setTitle("❌ Verification failed (no thread)")
+            .setDescription(`User: <@${interaction.user.id}>`)
+            .addFields({ name: "Error", value: err.message || "Unknown error" })
+            .setTimestamp()
+        );
+      }
     }
-    return;
-  }
 
-  if (interaction.commandName === "verify_manual") {
-    try {
-      if (interaction.guildId !== CONFIG.guildId) {
-        return interaction.reply({ content: "❌ Wrong server.", flags: MessageFlags.Ephemeral });
-      }
-
-      const invoker = await interaction.guild.members.fetch(interaction.user.id);
-      const isAdmin = invoker.permissions.has(PermissionFlagsBits.Administrator);
-      if (!isAdmin) {
-        return interaction.reply({ content: "❌ Admin only.", flags: MessageFlags.Ephemeral });
-      }
-
-      const targetUser = interaction.options.getUser("user", true);
-
-      const giveVerified = interaction.options.getBoolean("give_verified") ?? true;
-      const giveClanRole = interaction.options.getBoolean("give_clan_role") ?? false;
-      const giveKingdomRole = interaction.options.getBoolean("give_kingdom_role") ?? false;
-      const setNickname = interaction.options.getBoolean("set_nickname") ?? true;
-
-      const nameInput = interaction.options.getString("name", false);
-      const clanInput = interaction.options.getString("clan", false);
-      const idInput = interaction.options.getString("id", false);
-      const kingdomInput = interaction.options.getString("kingdom", false);
-
-      const clanTag = clanInput ? cleanClanTag(clanInput) : null;
-      const playerName = nameInput ? cleanPlayerName(nameInput) : null;
-      const gameId = idInput ? cleanId(idInput) : null;
-      const kingdom = kingdomInput ? cleanKingdom(kingdomInput) : null;
-
-      if (giveClanRole && !clanTag) {
-        return interaction.reply({
-          content: "❌ give_clan_role=true requires a clan tag.",
-          flags: MessageFlags.Ephemeral
-        });
-      }
-
-      if (giveKingdomRole && !kingdom) {
-        return interaction.reply({
-          content: "❌ give_kingdom_role=true requires a kingdom number.",
-          flags: MessageFlags.Ephemeral
-        });
-      }
-
-      if (setNickname && (!clanTag || !playerName || !isPlausibleName(playerName))) {
-        return interaction.reply({
-          content: "❌ set_nickname=true requires a valid clan + name.",
-          flags: MessageFlags.Ephemeral
-        });
-      }
-
-      await interaction.reply({
-        content: `🛂 Manual verification in progress for <@${targetUser.id}>…`,
-        flags: MessageFlags.Ephemeral
-      });
-
-      const result = await applyVerification({
-        guild: interaction.guild,
-        userId: targetUser.id,
-        clanTag,
-        playerName,
-        gameId,
-        kingdom,
-        giveVerified,
-        giveClanRole,
-        giveKingdomRole,
-        setNickname
-      });
-
-      const summary = [
-        `✅ Manual verification complete for <@${targetUser.id}>`,
-        giveVerified ? `• Verified role: **Yes**` : `• Verified role: **No**`,
-        giveClanRole ? `• Clan role: **${clanTag}**` : `• Clan role: **No**`,
-        giveKingdomRole ? `• Kingdom role: **#${kingdom}**` : `• Kingdom role: **No**`,
-        gameId ? `• Stored ID: **${gameId}**` : `• Stored ID: **(not provided)**`,
-        result.desiredNick ? `• Nickname: **${result.desiredNick}**` : `• Nickname: **(unchanged)**`
-      ].join("\n");
-
-      try {
-        if (interaction.channel?.isThread?.()) {
-          await interaction.channel.send(summary);
-        }
-      } catch {}
-    } catch (err) {
-      console.error(err);
-      try {
-        const payload = { content: `❌ Manual verification failed: ${err.message}`, flags: MessageFlags.Ephemeral };
-        if (interaction.deferred || interaction.replied) await interaction.followUp(payload);
-        else await interaction.reply(payload);
-      } catch {}
-    }
     return;
   }
 });

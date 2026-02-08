@@ -24,14 +24,12 @@ function parseFromText(text) {
 
   const idMatch = t.match(/ID\s*[:#]?\s*([0-9]{6,})/i);
 
-  // Handle multiple languages for Kingdom
   // English: "Kingdom: #247"
   // Polish:  "Królestwo: #247"
   const kingdomMatch =
     t.match(/Kingdom\s*[:#]?\s*#?\s*([0-9]{1,4})/i) ||
     t.match(/Kr[oó]lestwo\s*[:#]?\s*#?\s*([0-9]{1,4})/i);
 
-  // Handle multiple languages for Alliance
   // English: "Alliance: SOB"
   // Polish:  "Sojusz: SOB"
   const allianceMatch =
@@ -62,10 +60,7 @@ function parseFromText(text) {
           .trim();
 
         const cleaned = cleanPlayerName(candidate);
-
-        if (cleaned.length >= 3) {
-          playerName = cleaned;
-        }
+        if (cleaned.length >= 3) playerName = cleaned;
       }
     }
   }
@@ -124,8 +119,9 @@ async function ocrWithOptions(buffer, options = {}) {
 
 /**
  * Normalize screenshots across phones:
- * - some devices create massive images that cause sharp/tesseract to fail or OOM
- * - we downscale large ones and lightly upscale tiny ones
+ * - Downscale massive images to avoid memory spikes
+ * - Lightly upscale tiny images so text is legible
+ * - Convert to PNG to standardize format
  */
 async function normalizeInput(buffer) {
   const img = sharp(buffer, {
@@ -160,7 +156,6 @@ async function normalizeInput(buffer) {
     });
   }
 
-  // Convert to PNG to standardize odd formats/metadata (HEIF-ish behaviour etc.)
   const normalizedBuffer = await out.png().toBuffer();
   const normalizedMeta = await sharp(normalizedBuffer, {
     limitInputPixels: false,
@@ -170,16 +165,21 @@ async function normalizeInput(buffer) {
   return { buffer: normalizedBuffer, meta: normalizedMeta };
 }
 
-async function preprocessForCard(buffer, crop) {
-  // Crop first, then upscale to a sane width (don’t balloon huge screenshots)
-  let img = sharp(buffer, { limitInputPixels: false, failOnError: false })
-    .extract(crop)
-    .grayscale();
+async function preprocessForPanel(buffer, cropOrNull) {
+  // If cropOrNull is provided, extract it; otherwise treat the whole image as the panel.
+  let img = sharp(buffer, { limitInputPixels: false, failOnError: false }).grayscale();
 
-  const targetW = clamp(Math.floor(crop.width * 2), 700, 1600);
+  if (cropOrNull) img = img.extract(cropOrNull);
+
+  const meta = await img.metadata();
+  const w = meta.width || 0;
+
+  // Panel OCR wants readable text, but not insane sizes
+  const targetW = clamp(Math.floor(w * 2), 700, 1600);
   img = img.resize({ width: targetW, fit: "inside" });
 
   img = img.linear(1.6, -40).sharpen();
+
   return await img.png().toBuffer();
 }
 
@@ -188,6 +188,7 @@ async function preprocessForNameHunt(buffer, meta) {
 
   const baseW = meta?.width || 0;
 
+  // Clamp to avoid ballooning large screenshots
   const targetW = clamp(Math.floor(baseW * 1.25), 900, 2000);
   img = img.resize({ width: targetW, fit: "inside", withoutEnlargement: false });
 
@@ -197,14 +198,22 @@ async function preprocessForNameHunt(buffer, meta) {
 }
 
 export async function extractKingshotProfile(buffer) {
-  // Normalize input first so all phone screenshots behave similarly
   const normalized = await normalizeInput(buffer);
   const normBuf = normalized.buffer;
   const meta = normalized.meta;
 
   if (!meta.width || !meta.height) throw new Error("Invalid image (missing dimensions).");
 
-  // Multi-crop card region to handle different UI layouts/languages (compact panels)
+  // 1) First pass: support images that are ALREADY cropped to the bottom panel
+  // (like the example you posted)
+  const directPanelBuf = await preprocessForPanel(normBuf, null);
+  const directPanelText = await ocrWithOptions(directPanelBuf, { psm: "6" });
+  const directPanelParsed = parseFromText(directPanelText);
+
+  // If we got the essentials, we can accept immediately without any ratio cropping
+  const directHasCore = !!(directPanelParsed.id && directPanelParsed.kingdom && directPanelParsed.clanTag);
+
+  // 2) Fallback: multi-crop (handles full screenshots with varying UI layouts/languages)
   const cardCrops = [
     // Default (roomier UI)
     { left: 0.02, top: 0.56, width: 0.96, height: 0.40 },
@@ -213,38 +222,41 @@ export async function extractKingshotProfile(buffer) {
   ];
 
   let cardParsed = { id: null, kingdom: null, clanTag: null, playerName: null, raw: "" };
-  let cardTextBest = "";
+  let cardTextBest = directPanelText || "";
 
-  for (const ratios of cardCrops) {
-    const crop = cropByRatios(meta, ratios);
-    const buf = await preprocessForCard(normBuf, crop);
-    const text = await ocrWithOptions(buf, { psm: "6" });
-    const parsed = parseFromText(text);
+  if (!directHasCore) {
+    for (const ratios of cardCrops) {
+      const crop = cropByRatios(meta, ratios);
+      const buf = await preprocessForPanel(normBuf, crop);
+      const text = await ocrWithOptions(buf, { psm: "6" });
+      const parsed = parseFromText(text);
 
-    // Keep debug of best attempt
-    if (!cardTextBest) cardTextBest = text;
+      if (!cardTextBest) cardTextBest = text;
 
-    // If we have both critical fields, accept immediately
-    if (parsed.id && parsed.kingdom) {
-      cardParsed = parsed;
-      cardTextBest = text;
-      break;
+      if (parsed.id && parsed.kingdom) {
+        cardParsed = parsed;
+        cardTextBest = text;
+        break;
+      }
+
+      if (!cardParsed.id) cardParsed.id = parsed.id;
+      if (!cardParsed.kingdom) cardParsed.kingdom = parsed.kingdom;
+      if (!cardParsed.clanTag) cardParsed.clanTag = parsed.clanTag;
+      if (!cardParsed.playerName) cardParsed.playerName = parsed.playerName;
+      if (!cardParsed.raw) cardParsed.raw = parsed.raw;
+
+      if ((parsed.id || parsed.kingdom || parsed.clanTag) && text) {
+        cardTextBest = text;
+      }
     }
-
-    // Otherwise merge partial results
-    if (!cardParsed.id) cardParsed.id = parsed.id;
-    if (!cardParsed.kingdom) cardParsed.kingdom = parsed.kingdom;
-    if (!cardParsed.clanTag) cardParsed.clanTag = parsed.clanTag;
-    if (!cardParsed.playerName) cardParsed.playerName = parsed.playerName;
-    if (!cardParsed.raw) cardParsed.raw = parsed.raw;
-
-    // Prefer most recent text as debug if it got something useful
-    if ((parsed.id || parsed.kingdom || parsed.clanTag) && text) {
-      cardTextBest = text;
-    }
+  } else {
+    cardParsed = directPanelParsed;
+    cardTextBest = directPanelText;
   }
 
-  // Name hunt pass (full-ish image pass) for pulling [TAG]Name reliably
+  // Name hunt pass:
+  // For cropped panel images, this is still fine (it's just OCR over the image again),
+  // and it helps pull [TAG]Name if the panel pass missed the name.
   const huntBuf = await preprocessForNameHunt(normBuf, meta);
   const huntText = await ocrWithOptions(huntBuf, {
     psm: "6",
