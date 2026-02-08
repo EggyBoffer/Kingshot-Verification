@@ -11,10 +11,15 @@ export const CONFIG = {
   roleUnverifiedId: mustEnv("ROLE_UNVERIFIED_ID"),
   roleVerifiedId: mustEnv("ROLE_VERIFIED_ID"),
 
+  // Clan roles (tag -> role id)
   clanRoleMap: {
-    SOB: process.env.ROLE_CLAN_SOB_ID || null
+    SOB: process.env.ROLE_CLAN_SOB_ID || null,
+
+    // Added: THE clan
+    THE: "1470047600114925732"
   },
 
+  // Kingdom roles (kingdom number -> role id)
   kingdomRoleMap: {
     "247": process.env.ROLE_KINGDOM_247_ID || null
   }
@@ -23,10 +28,12 @@ export const CONFIG = {
 export function rolesFor(clanTag, kingdom) {
   const roleIds = [];
 
-  const clanRole = CONFIG.clanRoleMap[String(clanTag || "").toUpperCase()];
+  const clanKey = String(clanTag || "").toUpperCase().trim();
+  const clanRole = CONFIG.clanRoleMap[clanKey];
   if (clanRole) roleIds.push(clanRole);
 
-  const kRole = CONFIG.kingdomRoleMap[String(kingdom || "").replace(/^#/, "").trim()];
+  const kingdomKey = String(kingdom || "").replace(/^#/, "").trim();
+  const kRole = CONFIG.kingdomRoleMap[kingdomKey];
   if (kRole) roleIds.push(kRole);
 
   return roleIds;
