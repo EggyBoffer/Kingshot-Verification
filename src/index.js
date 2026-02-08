@@ -9,7 +9,8 @@ import {
   MessageFlags,
   ActionRowBuilder,
   ButtonBuilder,
-  ButtonStyle
+  ButtonStyle,
+  PermissionFlagsBits
 } from "discord.js";
 
 import { CONFIG, rolesFor } from "./roles.js";
@@ -86,7 +87,6 @@ function retryRow(userId) {
 }
 
 async function findLatestAttachmentUrlInThread(thread, userId) {
-  // Pull recent messages and find latest attachment from the user
   const msgs = await thread.messages.fetch({ limit: 50 }).catch(() => null);
   if (!msgs) return null;
 
@@ -168,6 +168,68 @@ async function runOcrAttempt(guild, thread, userId, imageUrl, isRetry) {
   await applyVerificationFromParsed(guild, userId, parsed, thread);
 }
 
+async function manualVerifyApply({
+  guild,
+  targetUserId,
+  actorUserId,
+  clanTag,
+  playerName,
+  gameId,
+  kingdom,
+  giveVerified,
+  giveClanRole,
+  giveKingdomRole,
+  setNickname,
+  removeUnverified
+}) {
+  const member = await guild.members.fetch(targetUserId);
+
+  const addRoles = [];
+  const removeRoles = [];
+
+  if (giveVerified && CONFIG.roleVerifiedId) addRoles.push(CONFIG.roleVerifiedId);
+  if (removeUnverified && CONFIG.roleUnverifiedId) removeRoles.push(CONFIG.roleUnverifiedId);
+
+  if (giveClanRole || giveKingdomRole) {
+    const derived = rolesFor(giveClanRole ? clanTag : null, giveKingdomRole ? kingdom : null);
+    addRoles.push(...derived);
+  }
+
+  if (addRoles.length) await member.roles.add(addRoles.filter(Boolean));
+  if (removeRoles.length) await member.roles.remove(removeRoles.filter(Boolean));
+
+  let nick = null;
+  if (setNickname && clanTag && playerName) {
+    nick = buildNickname(cleanClanTag(clanTag), cleanPlayerName(playerName));
+    if (nick) await member.setNickname(nick);
+  }
+
+  // Store whatever is provided (partial/manual)
+  upsertVerifiedUser(targetUserId, {
+    gameId: gameId || null,
+    clanTag: clanTag || null,
+    kingdom: kingdom || null,
+    playerName: playerName || null
+  });
+
+  await sendVerifyLog(
+    guild,
+    new EmbedBuilder()
+      .setTitle("🛂 Manual verification applied")
+      .setDescription(`Target: <@${targetUserId}> • By: <@${actorUserId}>`)
+      .addFields(
+        { name: "Verified role", value: giveVerified ? "Yes" : "No", inline: true },
+        { name: "Remove Unverified", value: removeUnverified ? "Yes" : "No", inline: true },
+        { name: "Clan role", value: giveClanRole ? (clanTag || "Missing") : "No", inline: true },
+        { name: "Kingdom role", value: giveKingdomRole ? (kingdom ? `#${kingdom}` : "Missing") : "No", inline: true },
+        { name: "Game ID", value: gameId || "(not provided)", inline: true },
+        { name: "Name", value: playerName || "(not provided)", inline: true },
+        { name: "Nickname", value: nick || "(unchanged)", inline: true }
+      )
+      .setTimestamp()
+  );
+}
+
 client.once("ready", () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
@@ -179,7 +241,6 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.isButton()) {
     const [action, targetUserId] = String(interaction.customId || "").split(":");
 
-    // Lock buttons to the user who is being verified
     if (!targetUserId || interaction.user.id !== targetUserId) {
       return interaction.reply({
         content: "❌ This button isn’t for you.",
@@ -244,6 +305,9 @@ client.on("interactionCreate", async (interaction) => {
   // ======================
   if (!interaction.isChatInputCommand()) return;
 
+  // ----------------------
+  // /verify
+  // ----------------------
   if (interaction.commandName === "verify") {
     let thread = null;
 
@@ -341,6 +405,80 @@ client.on("interactionCreate", async (interaction) => {
             .setTimestamp()
         );
       }
+    }
+
+    return;
+  }
+
+  // ----------------------
+  // /verify_manual  (ADMIN)
+  // ----------------------
+  if (interaction.commandName === "verify_manual") {
+    // ACK FAST or Discord times out (the thing that is currently biting you)
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => null);
+
+    try {
+      const guild = interaction.guild;
+      if (!guild) throw new Error("This command must be used in a server.");
+
+      const actor = await guild.members.fetch(interaction.user.id);
+      if (!actor.permissions.has(PermissionFlagsBits.Administrator)) {
+        throw new Error("Admin only.");
+      }
+
+      // These option names must match your deployed slash command definition.
+      // If your current command uses different names, update them here to match.
+      const targetUser = interaction.options.getUser("user", true);
+
+      const clanInput = interaction.options.getString("clan", false);
+      const nameInput = interaction.options.getString("name", false);
+      const idInput = interaction.options.getString("id", false);
+      const kingdomInput = interaction.options.getString("kingdom", false);
+
+      // Toggle flags (all optional)
+      const giveVerified = interaction.options.getBoolean("give_verified") ?? true;
+      const removeUnverified = interaction.options.getBoolean("remove_unverified") ?? true;
+      const giveClanRole = interaction.options.getBoolean("give_clan_role") ?? false;
+      const giveKingdomRole = interaction.options.getBoolean("give_kingdom_role") ?? true;
+      const setNickname = interaction.options.getBoolean("set_nickname") ?? false;
+
+      const clanTag = clanInput ? cleanClanTag(clanInput) : null;
+      const playerName = nameInput ? cleanPlayerName(nameInput) : null;
+      const gameId = idInput ? cleanId(idInput) : null;
+      const kingdom = kingdomInput ? cleanKingdom(kingdomInput) : null;
+
+      if (giveClanRole && !clanTag) {
+        throw new Error("give_clan_role=true requires a clan tag.");
+      }
+      if (giveKingdomRole && !kingdom) {
+        throw new Error("give_kingdom_role=true requires a kingdom number.");
+      }
+      if (setNickname && (!clanTag || !playerName)) {
+        throw new Error("set_nickname=true requires both clan + name.");
+      }
+
+      await manualVerifyApply({
+        guild,
+        targetUserId: targetUser.id,
+        actorUserId: interaction.user.id,
+        clanTag,
+        playerName,
+        gameId,
+        kingdom,
+        giveVerified,
+        giveClanRole,
+        giveKingdomRole,
+        setNickname,
+        removeUnverified
+      });
+
+      await interaction.editReply({
+        content: `✅ Manual verification applied to <@${targetUser.id}>.`
+      });
+    } catch (err) {
+      await interaction.editReply({
+        content: `❌ Manual verification failed: ${err.message || "Unknown error"}`
+      });
     }
 
     return;
